@@ -1,0 +1,241 @@
+---
+title: "ATELIER TWITTER - 12 MAI 2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+
+
+Load packages :
+```{r}
+require(ggplot2,quietly = T)
+require(scales,quietly = T)
+require(dplyr,quietly = T)
+require(tidyr,quietly = T)
+require(tidytext,quietly = T)
+require(tm,quietly = T)
+require(stringr,quietly = T)
+require(BTM,quietly = T)
+library(udpipe,quietly = T)
+require(rlist,quietly = T)
+```
+
+### Load the dataset 
+```{r}
+load(file = paste0("D:/datacraft/","datacraft_data_vaccination_5g_2021_05_11.RData"))
+dim(dataset_clean)
+```
+
+
+###Create time series
+```{r}
+
+daily_TS <- data.frame(table(substr(dataset_clean$tweet_date, start = 1,stop = 10)))
+daily_TS$Var1 <- as.Date(daily_TS$Var1)
+colnames(daily_TS) <- c("dates","N")
+p <- ggplot(daily_TS, aes(dates, N)) +
+  geom_bar(stat="identity", na.rm = TRUE)+
+  scale_x_date(labels=date_format ("%b %y"), breaks=date_breaks("1 month")) + theme_minimal()
+print(p)
+
+```
+
+
+### Without retweets 
+```{r}
+
+daily_TS_original <- data.frame(table(substr(dataset_clean$tweet_date[which(!dataset_clean$is_rt)], start = 1,stop = 10)))
+daily_TS_original$Var1 <- as.Date(daily_TS_original$Var1)
+colnames(daily_TS_original) <- c("dates","N")
+p <- ggplot(daily_TS_original, aes( dates, N)) +
+  geom_bar(stat="identity", na.rm = TRUE)+
+  scale_x_date(labels=date_format ("%b %y"), breaks=date_breaks("1 month")) + theme_minimal()
+p
+```
+
+### Stats desc 
+```{r}
+print(length(unique(dataset_clean$pseudo)))  # users uniques 
+print(length(unique(dataset_clean$status_id))) # tweets uniques, RT compris 
+print(length(unique(dataset_clean$pseudo[which(!dataset_clean$is_rt)]))) # Users uniques qui se sont exprimés
+print(length(unique(dataset_clean$status_id[which(!dataset_clean$is_rt)]))) # Tweets uniques sans RT 
+
+```
+
+### Topic modelling 
+Application d'un topic model pour avoir une première catégorisation du contenu des messages. 
+
+```{r}
+
+
+### Preprocessing 
+dataset_clean_for_TM <- dataset_clean[!dataset_clean$is_rt,]
+dataset_clean_for_TM$tweet_formatted_for_TM <- dataset_clean_for_TM$tweet_formatted
+dataset_clean_for_TM$tweet_formatted_for_TM <- unname(sapply(dataset_clean_for_TM$tweet_formatted_for_TM, function(x) {gsub(x = x, pattern = "(@.*?\\s{1})", replacement = "")}))
+dataset_clean_for_TM$tweet_formatted_for_TM <- sapply(dataset_clean_for_TM$tweet_formatted_for_TM, str_replace_all, pattern = "http.*?\\s|http.*?$", replacement = "")
+
+
+### Tokenization and stopwords deletion 
+clean_stopwords <- function(stopwords){
+  stopwords <- iconv(stopwords, from = 'UTF-8', to='ASCII//TRANSLIT')
+  stopwords <- str_replace_all(stopwords, "[[:punct:]]", "")     
+  return(stopwords)
+}
+basic_stopwords <- clean_stopwords(stopwords(kind = "fr"))
+d <- dataset_clean_for_TM %>%  unnest_tokens(word, tweet_formatted_for_TM) %>% filter(!word %in% basic_stopwords)
+
+###  Add some stopwords 
+additional_stopwords <- c("si","ca","va","ni","etc","via","",'vaccin',"vaccination","vaccins","vacciner","bill","gates",
+                          "contre","etre","fait","tout","tous","vont","faire")
+additional_stopwords <- clean_stopwords(additional_stopwords)
+d <- d %>% filter(!word %in% additional_stopwords)
+d <- d[which(nchar(d$word)>1),] 
+d <- d[,c("status_id" ,"word")]
+
+```
+### Modelling 
+
+Le nombre de topics est fixé arbitrairement à 15 pour gagner du temps. La modélisation est faite via un Gibbs Sampler. 
+```{r}
+
+K_ = 15
+model  <- BTM(d, k = K_, alpha = 1, beta = 0.01, iter = 100, trace = T)
+model
+```
+
+### Extraction des résultats 
+
+Le topic model groupe les tweets en clusters et sort des top terms qui permettent de labelliser ces clusters.
+```{r}
+# Top terms and topic proprtions 
+BTM_terms <- terms(model,top_n = 20)
+BTM_terms <- list.cbind(BTM_terms)[seq(1,(K_*2),2)] # Top terms 
+BTM_predictions <- data.frame(predict(model, newdata = d)) # Topic repartition per tweet
+
+# Associate top topic to each tweet : 
+association_threshold = .25
+number_of_topics_per_message = 1
+topics_per_tweets <- cbind(t(apply(BTM_predictions, 1, function(row, number_of_topics_per_message, 
+                                                 association_threshold) {
+  row_order <- order(row, decreasing = T)
+  row_order.values <- row[row_order]
+  row_order[which(row_order.values < association_threshold)] <- 0
+  row_order.values[which(row_order.values < association_threshold)] <- 0
+  output <- c(row_order[1:number_of_topics_per_message], 
+              row_order.values[1:number_of_topics_per_message])
+  return(output)
+}, number_of_topics_per_message, association_threshold)))
+topics_per_tweets <- as.data.frame(topics_per_tweets)
+colnames(topics_per_tweets) <- c("topic_id","topic_proportion")
+topics_per_tweets$status_id <- rownames(topics_per_tweets)
+rownames(topics_per_tweets) <- NULL
+dataset_clean_for_TM <- merge(dataset_clean_for_TM, topics_per_tweets, by = 'status_id', all.x = T, all.y = F)
+
+# Topics proportions : 
+table(dataset_clean_for_TM$topic_id, useNA = "ifany")
+topics_proportions <- data.frame("topic_id" = c(0, seq(K_),"NA"), 
+                                 "top_terms" = c("No topic",apply(BTM_terms[1:10,], 2, paste, collapse = ", "),"Deleted posts"),
+                                 "N_posts" = as.data.frame(table(dataset_clean_for_TM$topic_id, useNA = "always"))[,2],
+                                 "P_posts" = as.data.frame(table(dataset_clean_for_TM$topic_id, useNA = "always")/nrow(dataset_clean_for_TM)*100)[,2])
+
+```
+
+### Sortie des résultats 
+
+```{r}
+# Proportions and top terms 
+print(topics_proportions)
+
+# Sample of posts 
+for (t_ in 1:K_){
+  print(dataset_clean_for_TM[dataset_clean_for_TM$status_id %in% sample(dataset_clean_for_TM[which(dataset_clean_for_TM$topic_id == t_),"status_id"],5), c("status_id","tweet","topic_proportion")])
+}
+
+
+```
+
+
+```{r}
+#idee de base :
+# à partir des clusters de themes, identifier des pseudos qui communiquent beaucp (les influenceurs)
+# et voir quels sont leurs thèmes privilégiés
+# approche classique : PCA pour réduire les dimensions 15 thèmes -> 3 dimensions
+# puis kmeans pour faire des clusters d'influenceurs
+# premiers résultats intéressants à poursuivre....
+
+stats<-dataset_clean_for_TM %>% group_by(pseudo) %>% count
+quantile(stats$n,probs = seq(0.8, 1, 0.01))
+
+(influenceurs<-dataset_clean_for_TM %>% group_by(pseudo) %>% count %>% filter(n>100) %>% arrange(-n))
+
+poids_themes<-dataset_clean_for_TM %>%
+  group_by(topic_id) %>% 
+  summarize(nb_tweet_topic=n()) %>% ungroup
+
+themes_abordes<-dataset_clean_for_TM %>%
+  group_by(pseudo,topic_id) %>%
+  count  %>%
+    pivot_wider(names_from = topic_id, values_from = n) %>% 
+  right_join(influenceurs,by="pseudo")
+
+library(tibble)
+themes_abordes<-themes_abordes %>%
+  mutate(
+    across(c(1:17),
+           .fns = ~./n)) %>% mutate_all(~replace(., is.na(.), 0)) 
+
+library(FactoMineR)
+library(factoextra)
+
+# PCA ----
+res.pca <- PCA(themes_abordes[,2:19],ncp=3, graph=F,col.w=19)
+fviz_eig(res.pca)
+
+
+#contribution des variables aux axes
+library("corrplot")
+corrplot(var$cos2, is.corr=FALSE)
+
+
+fviz_pca_ind (res.pca, 
+             pointshape = 21, 
+             repel = TRUE # Évite le chevauchement de texte
+             )
+
+
+# kmeans ----
+data.for.kmeans<-res.pca$ind$coord
+
+library(cluster)
+avg_sil <- function(k) {
+  print(paste0("silhouette k:",k))
+  km.res <- kmeans(data.for.kmeans, centers = k, nstart = 25)
+  ss <- silhouette(km.res$cluster, dist(data.for.kmeans))
+  return(mean(ss[, 3]))
+}
+# Set maximum cluster 
+max_k <-10
+# Run algorithm over a range of k 
+avg.silhouette <- sapply(2:max_k, avg_sil)
+# Create a data frame to plot the graph
+silhouette.data <-data.frame(2:max_k, avg.silhouette)
+# Plot the graph
+ggplot(silhouette.data, aes(x = X2.max_k, y = avg.silhouette)) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous(breaks = seq(1, max_k, by = 1))
+
+#je retiens 6 clusters
+clusters <- kmeans(data.for.kmeans, 9, nstart = 25)
+clusters$size
+ # graph des individus, en fonction des dimensions 1 et 2 de l'ACP
+fviz_cluster(clusters, data = themes_abordes[,2:19],geom="point")
+
+
+
+```
+
